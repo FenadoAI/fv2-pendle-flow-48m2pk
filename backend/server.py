@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import httpx
 from dotenv import load_dotenv
 from fastapi import APIRouter, FastAPI, HTTPException, Request
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -62,6 +63,28 @@ class SearchResponse(BaseModel):
     summary: str
     search_results: Optional[dict] = None
     sources_count: int
+    error: Optional[str] = None
+
+
+class VaultData(BaseModel):
+    address: str
+    name: str
+    symbol: str
+    expiry: str
+    chain_id: int
+    volume_24h: float
+    liquidity: float
+    implied_apy: float
+    underlying_apy: float
+    lp_apy: float
+    pt_price: float
+    yt_price: float
+
+
+class VaultsResponse(BaseModel):
+    success: bool
+    vaults: List[VaultData]
+    total: int
     error: Optional[str] = None
 
 
@@ -234,6 +257,94 @@ async def get_agent_capabilities(request: Request):
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("Error getting capabilities")
         return {"success": False, "error": str(exc)}
+
+
+@api_router.get("/vaults", response_model=VaultsResponse)
+async def get_pendle_vaults(chain_id: int = 1):
+    """Fetch all active Pendle vaults (markets) from Pendle API."""
+    try:
+        pendle_api_url = f"https://api-v2.pendle.finance/core/v1/{chain_id}/markets/active"
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(pendle_api_url)
+            response.raise_for_status()
+            data = response.json()
+
+        vaults = []
+        for market in data.get("markets", []):
+            try:
+                details = market.get("details", {})
+                vault = VaultData(
+                    address=market.get("address", ""),
+                    name=market.get("name", "Unknown"),
+                    symbol=market.get("symbol", ""),
+                    expiry=market.get("expiry", ""),
+                    chain_id=chain_id,
+                    volume_24h=float(details.get("volume24h", 0)),
+                    liquidity=float(details.get("liquidity", 0)),
+                    implied_apy=float(details.get("impliedApy", 0)),
+                    underlying_apy=float(details.get("underlyingApy", 0)),
+                    lp_apy=float(details.get("lpApy", 0)),
+                    pt_price=float(details.get("ptPrice", 0)),
+                    yt_price=float(details.get("ytPrice", 0)),
+                )
+                vaults.append(vault)
+            except (ValueError, TypeError, KeyError) as e:
+                logger.warning(f"Error parsing vault data for {market.get('address')}: {e}")
+                continue
+
+        return VaultsResponse(
+            success=True,
+            vaults=vaults,
+            total=len(vaults),
+        )
+
+    except httpx.HTTPError as exc:
+        logger.exception("Error fetching vaults from Pendle API")
+        return VaultsResponse(
+            success=False,
+            vaults=[],
+            total=0,
+            error=f"Failed to fetch vaults: {str(exc)}",
+        )
+    except Exception as exc:
+        logger.exception("Unexpected error in get_vaults")
+        return VaultsResponse(
+            success=False,
+            vaults=[],
+            total=0,
+            error=str(exc),
+        )
+
+
+@api_router.get("/vaults/{vault_address}")
+async def get_vault_details(vault_address: str, chain_id: int = 1):
+    """Fetch detailed information for a specific Pendle vault."""
+    try:
+        pendle_api_url = f"https://api-v2.pendle.finance/core/v2/{chain_id}/markets/{vault_address}/data"
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(pendle_api_url)
+            response.raise_for_status()
+            data = response.json()
+
+        return {
+            "success": True,
+            "data": data,
+        }
+
+    except httpx.HTTPError as exc:
+        logger.exception(f"Error fetching vault details for {vault_address}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to fetch vault details: {str(exc)}",
+        )
+    except Exception as exc:
+        logger.exception(f"Unexpected error fetching vault {vault_address}")
+        raise HTTPException(
+            status_code=500,
+            detail=str(exc),
+        )
 
 
 app.include_router(api_router)
